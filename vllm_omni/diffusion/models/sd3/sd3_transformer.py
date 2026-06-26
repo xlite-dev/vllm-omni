@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # TODO replace this with vLLM implementation
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, SD35AdaLayerNormZeroX
@@ -19,6 +20,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
@@ -156,8 +158,12 @@ class SD3CrossAttention(nn.Module):
         else:
             self.to_out = None
 
-        self.norm_added_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_added_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        if added_kv_proj_dim is not None and qk_norm:
+            self.norm_added_q = RMSNorm(head_dim, eps=eps)
+            self.norm_added_k = RMSNorm(head_dim, eps=eps)
+        else:
+            self.norm_added_q = nn.Identity()
+            self.norm_added_k = nn.Identity()
 
         self.attn = Attention(
             num_heads=self.to_qkv.num_heads,
@@ -299,6 +305,8 @@ class SD3TransformerBlock(nn.Module):
                 dim=dim,
                 num_heads=num_attention_heads,
                 head_dim=attention_head_dim,
+                added_kv_proj_dim=None,
+                context_pre_only=True,
                 out_dim=dim,
                 qk_norm=True if qk_norm == "rms_norm" else False,
                 eps=1e-6,
@@ -380,7 +388,14 @@ class SD3Transformer2DModel(nn.Module):
     The Transformer model introduced in [Stable Diffusion 3](https://huggingface.co/papers/2403.03206).
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_1,
+        }
+    )
+
     _repeated_blocks = ["SD3TransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
     def __init__(
         self,

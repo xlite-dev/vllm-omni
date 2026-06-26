@@ -19,7 +19,7 @@ import inspect
 import json
 import os
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -38,7 +38,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -140,7 +143,11 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OvisImagePipeline(nn.Module, CFGParallelMixin):
+class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,
@@ -162,17 +169,32 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         self._execution_device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
+
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        ovis_subfolders = ["scheduler", "text_encoder", "vae", "tokenizer"]
+        prefetch_subfolders(model, ovis_subfolders, local_files_only=local_files_only)
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
 
-        self.text_encoder = Qwen3Model.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen3Model.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=ovis_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         )
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self._execution_device
-        )
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKL.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=ovis_subfolders,
+            local_files_only=local_files_only,
+        ).to(self._execution_device)
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
@@ -188,6 +210,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         self.user_prompt_begin_id = 28
         self.tokenizer_max_length = 256 + self.user_prompt_begin_id
         self.default_sample_size = 128
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def _get_messages(
         self,
@@ -681,6 +706,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
 
         negative_text_ids = None
         if do_classifier_free_guidance:
+            negative_prompt = negative_prompt if negative_prompt is not None else ""
             negative_prompt_embeds, negative_text_ids = self.encode_prompt(
                 prompt=negative_prompt,
                 prompt_embeds=negative_prompt_embeds,
@@ -734,7 +760,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
